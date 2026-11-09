@@ -20,14 +20,13 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Setup Expo and EAS CLI
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
 
       - name: Install dependencies
         run: npm ci
 
       - name: Trigger EAS Android APK Build (preview profile)
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN || 'hLBc1m3dt3FBc8IUZ96ucgVpURAngNWkG_DK9TFM' }}
         run: eas build --platform android --profile preview --non-interactive --no-wait
