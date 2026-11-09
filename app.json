@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "Barreto Cambio",
+    "slug": "barreto-cambio",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#111214"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.barreto.cambio"
+    },
+    "android": {
+      "package": "com.barreto.cambio",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#111214"
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "447746c7-0549-4fdb-9f3b-014576b0d6b2"
+      }
+    },
+    "owner": "gaabarreto"
+  }
+}
