@@ -12,6 +12,8 @@ import {
   Animated,
   Platform,
   AppState,
+  ScrollView,
+  LayoutAnimation,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Clipboard from 'expo-clipboard';
@@ -26,9 +28,13 @@ import {
 import {
   fetchRatesInCascade,
   loadCachedRates,
+  loadCachedHistory,
+  resolveRateForDate,
+  fetchMonthHistoryIfNeeded,
   saveUserSessionState,
   loadUserSessionState,
 } from '../services/rateService';
+import RateCalendarDropdown from '../components/RateCalendarDropdown';
 
 export default function CalculatorScreen() {
   const { isDark, colors, toggleTheme } = useTheme();
@@ -37,21 +43,25 @@ export default function CalculatorScreen() {
   const [selectedCurrency, setSelectedCurrency] = useState('USD');
   const [menuOpen, setMenuOpen] = useState(false);
 
-  // Permitir alternar entre la tasa vigente del día ("CURRENT") y la tasa previa del historial ("PREVIOUS")
-  const [rateMode, setRateMode] = useState('CURRENT');
+  // Estado del calendario desplegable e índice histórico por fecha ISO
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [historyMap, setHistoryMap] = useState({});
 
-  // Estado de tasas y metadatos (inicializado con el corte vigente del BCV)
+  // Estado de la tasa activa (vigente o seleccionada desde el calendario)
   const [ratesData, setRatesData] = useState({
+    isoDate: '2026-11-06',
     usd: 896.1225,
     eur: 1004.9566,
+    previousIsoDate: '2026-11-05',
     previousUsd: 894.8876,
     previousEur: 1006.0326,
-    previousDateFormatted: 'Jueves, 05/11/2026',
     trend: {
       USD: { diff: 1.23, pct: 0.14 },
       EUR: { diff: -1.08, pct: -0.11 },
     },
     formattedDate: 'Viernes, 06/11/2026',
+    latestPublishedIso: '2026-11-09',
+    todayIso: '2026-11-06',
     source: 'BCV Oficial',
     isOffline: false,
   });
@@ -73,20 +83,9 @@ export default function CalculatorScreen() {
   const toastOpacity = useRef(new Animated.Value(0)).current;
   const [toastMessage, setToastMessage] = useState('');
 
-  // Tasa activa según la divisa seleccionada y si está viendo la tasa actual o la previa del historial
+  // Tasa activa según la divisa seleccionada
   const activeRate =
-    rateMode === 'PREVIOUS'
-      ? selectedCurrency === 'USD'
-        ? ratesData.previousUsd || ratesData.usd
-        : ratesData.previousEur || ratesData.eur
-      : selectedCurrency === 'USD'
-        ? ratesData.usd
-        : ratesData.eur;
-
-  const displayedDate =
-    rateMode === 'PREVIOUS' && ratesData.previousDateFormatted
-      ? `${ratesData.previousDateFormatted} (Previa)`
-      : ratesData.formattedDate;
+    selectedCurrency === 'USD' ? ratesData.usd : ratesData.eur;
 
   // Mostrar notificación minimalista al copiar
   const triggerToast = useCallback(
@@ -112,13 +111,14 @@ export default function CalculatorScreen() {
     [toastOpacity]
   );
 
-  // Sincronización inicial Offline-First + Consulta inteligente de la tasa más reciente + Auto-actualización al volver a la app
+  // Sincronización inicial Offline-First + Carga de historial para el calendario
   useEffect(() => {
     let isMounted = true;
 
     const initialize = async () => {
-      const [cachedRates, savedSession] = await Promise.all([
+      const [cachedRates, cachedHist, savedSession] = await Promise.all([
         loadCachedRates(),
+        loadCachedHistory(),
         loadUserSessionState(),
       ]);
 
@@ -135,6 +135,10 @@ export default function CalculatorScreen() {
         setForeignValue(initialForeign);
         setForeignDisplay(formatCurrencyDisplay(initialForeign));
 
+        if (cachedHist) {
+          setHistoryMap(cachedHist);
+        }
+
         if (cachedRates) {
           setRatesData({ ...cachedRates, isOffline: true });
           const rateToUse =
@@ -145,12 +149,17 @@ export default function CalculatorScreen() {
         }
       }
 
-      // Consultar las 3 APIs y seleccionar la de fecha más reciente
-      const freshRates = await fetchRatesInCascade();
-      if (isMounted && freshRates) {
-        setRatesData(freshRates);
+      // Consultar las APIs y el historial anual
+      const result = await fetchRatesInCascade();
+      if (isMounted && result?.activeRateData) {
+        setRatesData(result.activeRateData);
+        if (result.historyMap) {
+          setHistoryMap(result.historyMap);
+        }
         const rateToUse =
-          initialCurrency === 'USD' ? freshRates.usd : freshRates.eur;
+          initialCurrency === 'USD'
+            ? result.activeRateData.usd
+            : result.activeRateData.eur;
         const computedVes = convertForeignToVes(initialForeign, rateToUse);
         setVesValue(computedVes);
         setVesDisplay(formatCurrencyDisplay(computedVes));
@@ -160,15 +169,20 @@ export default function CalculatorScreen() {
 
     initialize();
 
-    // Actualizar automáticamente las tasas cada vez que el usuario abre la app del segundo plano (día con día)
-    const subscription = AppState.addEventListener('change', async (nextAppState) => {
-      if (nextAppState === 'active') {
-        const latestRates = await fetchRatesInCascade();
-        if (isMounted && latestRates) {
-          setRatesData(latestRates);
+    const subscription = AppState.addEventListener(
+      'change',
+      async (nextAppState) => {
+        if (nextAppState === 'active') {
+          const result = await fetchRatesInCascade();
+          if (isMounted && result?.activeRateData) {
+            setRatesData(result.activeRateData);
+            if (result.historyMap) {
+              setHistoryMap(result.historyMap);
+            }
+          }
         }
       }
-    });
+    );
 
     return () => {
       isMounted = false;
@@ -176,7 +190,7 @@ export default function CalculatorScreen() {
     };
   }, []);
 
-  // Recalcular automáticamente cuando cambia la divisa (USD <-> EUR), el modo (Actual <-> Previa) o se actualiza la tasa
+  // Recalcular automáticamente cuando cambia la divisa (USD <-> EUR) o se selecciona otra fecha en el calendario
   useEffect(() => {
     if (!activeRate || activeRate <= 0) return;
 
@@ -189,7 +203,7 @@ export default function CalculatorScreen() {
       setVesValue(updatedVes);
       setVesDisplay(formatCurrencyDisplay(updatedVes));
     }
-  }, [selectedCurrency, activeRate, rateMode]);
+  }, [selectedCurrency, activeRate]);
 
   // Manejador de edición en el input de Divisa ($ o €)
   const handleForeignChange = (text) => {
@@ -242,14 +256,45 @@ export default function CalculatorScreen() {
     });
   };
 
+  // Abrir/cerrar el calendario desplegable con animación fluida
+  const handleToggleCalendar = () => {
+    Keyboard.dismiss();
+    setMenuOpen(false);
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setCalendarOpen((prev) => !prev);
+  };
+
+  // Seleccionar una fecha en el calendario desplegable
+  const handleSelectDateFromCalendar = (isoDate) => {
+    const resolved = resolveRateForDate(isoDate, historyMap);
+    if (resolved) {
+      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      setRatesData((prev) => ({
+        ...prev,
+        ...resolved,
+      }));
+      setCalendarOpen(false);
+    }
+  };
+
+  // Si el usuario navega a otro mes/año en el calendario, cargar las tasas de ese mes si no están en memoria
+  const handleCalendarMonthChange = async (year, month) => {
+    const updated = await fetchMonthHistoryIfNeeded(year, month, historyMap);
+    if (updated) {
+      setHistoryMap({ ...updated });
+    }
+  };
+
   // Refrescar tasas manualmente
   const handleRefreshRates = async () => {
     if (isRefreshing) return;
     setIsRefreshing(true);
-    setRateMode('CURRENT');
-    const fresh = await fetchRatesInCascade();
-    if (fresh) {
-      setRatesData(fresh);
+    const result = await fetchRatesInCascade();
+    if (result?.activeRateData) {
+      setRatesData(result.activeRateData);
+      if (result.historyMap) {
+        setHistoryMap(result.historyMap);
+      }
     }
     setIsRefreshing(false);
   };
@@ -280,7 +325,7 @@ export default function CalculatorScreen() {
     });
   };
 
-  // Datos de tendencia para la moneda activa
+  // Datos de tendencia para la moneda y fecha activas
   const currentTrend = ratesData.trend?.[selectedCurrency] || {
     diff: 0,
     pct: 0,
@@ -302,222 +347,169 @@ export default function CalculatorScreen() {
       >
         <StatusBar style={isDark ? 'light' : 'dark'} />
 
-        {/* Barra Superior Minimalista: Marca + Estado Offline + Switch Tema */}
-        <View style={styles.headerBar}>
-          <View style={styles.brandCluster}>
-            <Text style={[styles.brandSubtitle, { color: colors.textMuted }]}>
-              BARRETO
-            </Text>
-            <Text style={[styles.brandTitle, { color: colors.textPrimary }]}>
-              al cambio
-            </Text>
-          </View>
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          {/* Barra Superior Minimalista: Marca + Estado Offline + Switch Tema */}
+          <View style={styles.headerBar}>
+            <View style={styles.brandCluster}>
+              <Text style={[styles.brandSubtitle, { color: colors.textMuted }]}>
+                BARRETO
+              </Text>
+              <Text style={[styles.brandTitle, { color: colors.textPrimary }]}>
+                al cambio
+              </Text>
+            </View>
 
-          <View style={styles.headerActions}>
-            {ratesData.isOffline && (
-              <View
-                style={[
-                  styles.offlineBadge,
-                  { backgroundColor: colors.offlineBadgeBg },
-                ]}
-              >
-                <Feather
-                  name="wifi-off"
-                  size={12}
-                  color={colors.offlineBadgeText}
-                />
-                <Text
+            <View style={styles.headerActions}>
+              {ratesData.isOffline && (
+                <View
                   style={[
-                    styles.offlineBadgeText,
-                    { color: colors.offlineBadgeText },
+                    styles.offlineBadge,
+                    { backgroundColor: colors.offlineBadgeBg },
                   ]}
                 >
-                  Tasa Offline
-                </Text>
-              </View>
-            )}
-
-            <TouchableOpacity
-              onPress={handleRefreshRates}
-              activeOpacity={0.7}
-              style={[
-                styles.iconActionButton,
-                {
-                  backgroundColor: colors.cardSurface,
-                  borderColor: colors.cardBorder,
-                },
-              ]}
-              accessibilityLabel="Actualizar tasa"
-            >
-              {isRefreshing || isLoading ? (
-                <ActivityIndicator size="small" color={colors.accentGreen} />
-              ) : (
-                <Feather
-                  name="refresh-cw"
-                  size={17}
-                  color={colors.textSecondary}
-                />
+                  <Feather
+                    name="wifi-off"
+                    size={12}
+                    color={colors.offlineBadgeText}
+                  />
+                  <Text
+                    style={[
+                      styles.offlineBadgeText,
+                      { color: colors.offlineBadgeText },
+                    ]}
+                  >
+                    Tasa Offline
+                  </Text>
+                </View>
               )}
-            </TouchableOpacity>
 
-            <TouchableOpacity
-              onPress={toggleTheme}
-              activeOpacity={0.7}
-              style={[
-                styles.iconActionButton,
-                {
-                  backgroundColor: colors.cardSurface,
-                  borderColor: colors.cardBorder,
-                },
-              ]}
-              accessibilityLabel="Cambiar tema claro u oscuro"
-            >
-              <Feather
-                name={isDark ? 'sun' : 'moon'}
-                size={18}
-                color={isDark ? '#FBBF24' : '#3B4252'}
-              />
-            </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleRefreshRates}
+                activeOpacity={0.7}
+                style={[
+                  styles.iconActionButton,
+                  {
+                    backgroundColor: colors.cardSurface,
+                    borderColor: colors.cardBorder,
+                  },
+                ]}
+                accessibilityLabel="Actualizar tasa"
+              >
+                {isRefreshing || isLoading ? (
+                  <ActivityIndicator size="small" color={colors.accentGreen} />
+                ) : (
+                  <Feather
+                    name="refresh-cw"
+                    size={17}
+                    color={colors.textSecondary}
+                  />
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={toggleTheme}
+                activeOpacity={0.7}
+                style={[
+                  styles.iconActionButton,
+                  {
+                    backgroundColor: colors.cardSurface,
+                    borderColor: colors.cardBorder,
+                  },
+                ]}
+                accessibilityLabel="Cambiar tema claro u oscuro"
+              >
+                <Feather
+                  name={isDark ? 'sun' : 'moon'}
+                  size={18}
+                  color={isDark ? '#FBBF24' : '#3B4252'}
+                />
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
 
-        {/* Contenedor Exterior Estilo Imagen 3 (Bordes suaves, padding generoso) */}
-        <View
-          style={[
-            styles.outerFrame,
-            {
-              backgroundColor: colors.outerSurface,
-              borderColor: colors.cardBorder,
-              shadowColor: colors.shadowColor,
-              shadowOpacity: colors.shadowOpacity,
-            },
-          ]}
-        >
-          {/* Tarjeta Principal Estilo Imágenes 1 y 2 */}
+          {/* Contenedor Exterior Estilo Imagen 3 (Bordes suaves, padding generoso) */}
           <View
             style={[
-              styles.calculatorCard,
+              styles.outerFrame,
               {
-                backgroundColor: colors.cardSurface,
+                backgroundColor: colors.outerSurface,
                 borderColor: colors.cardBorder,
                 shadowColor: colors.shadowColor,
                 shadowOpacity: colors.shadowOpacity,
               },
             ]}
           >
-            {/* Selector Superior: Botón Verde Redondeado + Menú de 3 puntos */}
-            <View style={styles.selectorRow}>
-              <TouchableOpacity
-                activeOpacity={0.85}
-                onPress={() => handleSwitchCurrency()}
-                style={[
-                  styles.currencyPillButton,
-                  { backgroundColor: colors.accentGreen },
-                ]}
-              >
-                <Text
+            {/* Tarjeta Principal Estilo Imágenes 1 y 2 */}
+            <View
+              style={[
+                styles.calculatorCard,
+                {
+                  backgroundColor: colors.cardSurface,
+                  borderColor: colors.cardBorder,
+                  shadowColor: colors.shadowColor,
+                  shadowOpacity: colors.shadowOpacity,
+                },
+              ]}
+            >
+              {/* Selector Superior: Botón Verde Redondeado + Menú de 3 puntos */}
+              <View style={styles.selectorRow}>
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => handleSwitchCurrency()}
                   style={[
-                    styles.currencyPillText,
-                    { color: colors.accentGreenText },
+                    styles.currencyPillButton,
+                    { backgroundColor: colors.accentGreen },
                   ]}
                 >
-                  {selectedCurrency === 'USD' ? 'Dólar BCV' : 'Euro'}
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                activeOpacity={0.6}
-                onPress={() => setMenuOpen((prev) => !prev)}
-                style={styles.dotsMenuTrigger}
-                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-              >
-                <MaterialCommunityIcons
-                  name="dots-vertical"
-                  size={24}
-                  color={colors.textSecondary}
-                />
-              </TouchableOpacity>
-            </View>
-
-            {/* Menú Flotante Minimalista (Inspirado en el popover de Imagen 3) */}
-            {menuOpen && (
-              <View
-                style={[
-                  styles.floatingPopover,
-                  {
-                    backgroundColor: colors.cardSurface,
-                    borderColor: colors.cardBorder,
-                    shadowColor: colors.shadowColor,
-                  },
-                ]}
-              >
-                <Pressable
-                  onPress={() => handleSwitchCurrency('USD')}
-                  style={styles.popoverItem}
-                >
-                  <Feather
-                    name="dollar-sign"
-                    size={15}
-                    color={
-                      selectedCurrency === 'USD'
-                        ? colors.accentGreen
-                        : colors.textSecondary
-                    }
-                  />
                   <Text
                     style={[
-                      styles.popoverItemText,
-                      {
-                        color: colors.textPrimary,
-                        fontWeight: selectedCurrency === 'USD' ? '700' : '500',
-                      },
+                      styles.currencyPillText,
+                      { color: colors.accentGreenText },
                     ]}
                   >
-                    Dólar BCV (USD)
+                    {selectedCurrency === 'USD' ? 'Dólar BCV' : 'Euro'}
                   </Text>
-                </Pressable>
+                </TouchableOpacity>
 
-                <Pressable
-                  onPress={() => handleSwitchCurrency('EUR')}
-                  style={styles.popoverItem}
+                <TouchableOpacity
+                  activeOpacity={0.6}
+                  onPress={() => setMenuOpen((prev) => !prev)}
+                  style={styles.dotsMenuTrigger}
+                  hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                 >
                   <MaterialCommunityIcons
-                    name="currency-eur"
-                    size={16}
-                    color={
-                      selectedCurrency === 'EUR'
-                        ? colors.accentGreen
-                        : colors.textSecondary
-                    }
+                    name="dots-vertical"
+                    size={24}
+                    color={colors.textSecondary}
                   />
-                  <Text
-                    style={[
-                      styles.popoverItemText,
-                      {
-                        color: colors.textPrimary,
-                        fontWeight: selectedCurrency === 'EUR' ? '700' : '500',
-                      },
-                    ]}
-                  >
-                    Euro BCV (EUR)
-                  </Text>
-                </Pressable>
+                </TouchableOpacity>
+              </View>
 
-                {ratesData.previousDateFormatted && (
+              {/* Menú Flotante Minimalista (Inspirado en el popover de Imagen 3) */}
+              {menuOpen && (
+                <View
+                  style={[
+                    styles.floatingPopover,
+                    {
+                      backgroundColor: colors.cardSurface,
+                      borderColor: colors.cardBorder,
+                      shadowColor: colors.shadowColor,
+                    },
+                  ]}
+                >
                   <Pressable
-                    onPress={() => {
-                      setRateMode((prev) =>
-                        prev === 'CURRENT' ? 'PREVIOUS' : 'CURRENT'
-                      );
-                      setMenuOpen(false);
-                    }}
+                    onPress={() => handleSwitchCurrency('USD')}
                     style={styles.popoverItem}
                   >
                     <Feather
-                      name="clock"
-                      size={14}
+                      name="dollar-sign"
+                      size={15}
                       color={
-                        rateMode === 'PREVIOUS'
+                        selectedCurrency === 'USD'
                           ? colors.accentGreen
                           : colors.textSecondary
                       }
@@ -527,272 +519,344 @@ export default function CalculatorScreen() {
                         styles.popoverItemText,
                         {
                           color: colors.textPrimary,
-                          fontWeight: rateMode === 'PREVIOUS' ? '700' : '500',
+                          fontWeight:
+                            selectedCurrency === 'USD' ? '700' : '500',
                         },
                       ]}
                     >
-                      {rateMode === 'PREVIOUS'
-                        ? 'Volver a tasa actual'
-                        : 'Ver tasa jornada previa'}
+                      Dólar BCV (USD)
                     </Text>
                   </Pressable>
-                )}
 
-                <Pressable
-                  onPress={() => {
-                    handleResetToOne();
-                    setMenuOpen(false);
-                  }}
-                  style={styles.popoverItem}
+                  <Pressable
+                    onPress={() => handleSwitchCurrency('EUR')}
+                    style={styles.popoverItem}
+                  >
+                    <MaterialCommunityIcons
+                      name="currency-eur"
+                      size={16}
+                      color={
+                        selectedCurrency === 'EUR'
+                          ? colors.accentGreen
+                          : colors.textSecondary
+                      }
+                    />
+                    <Text
+                      style={[
+                        styles.popoverItemText,
+                        {
+                          color: colors.textPrimary,
+                          fontWeight:
+                            selectedCurrency === 'EUR' ? '700' : '500',
+                        },
+                      ]}
+                    >
+                      Euro BCV (EUR)
+                    </Text>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={() => {
+                      handleToggleCalendar();
+                    }}
+                    style={styles.popoverItem}
+                  >
+                    <MaterialCommunityIcons
+                      name="calendar-month-outline"
+                      size={16}
+                      color={colors.accentGreen}
+                    />
+                    <Text
+                      style={[
+                        styles.popoverItemText,
+                        { color: colors.textPrimary, fontWeight: '600' },
+                      ]}
+                    >
+                      Elegir fecha en calendario
+                    </Text>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={() => {
+                      handleResetToOne();
+                      setMenuOpen(false);
+                    }}
+                    style={styles.popoverItem}
+                  >
+                    <Feather
+                      name="rotate-ccw"
+                      size={14}
+                      color={colors.textSecondary}
+                    />
+                    <Text
+                      style={[
+                        styles.popoverItemText,
+                        { color: colors.textSecondary },
+                      ]}
+                    >
+                      Restablecer a 1,00
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {/* Fila de Input 1: Moneda Extranjera ($ o €) */}
+              <View style={styles.inputsSection}>
+                <View
+                  style={[
+                    styles.inputFieldContainer,
+                    {
+                      borderBottomColor:
+                        focusedField === 'FOREIGN'
+                          ? colors.inputUnderlineActive
+                          : colors.inputUnderline,
+                    },
+                  ]}
                 >
-                  <Feather
-                    name="rotate-ccw"
-                    size={14}
-                    color={colors.textSecondary}
-                  />
                   <Text
                     style={[
-                      styles.popoverItemText,
-                      { color: colors.textSecondary },
+                      styles.currencySymbol,
+                      { color: colors.textPrimary },
                     ]}
                   >
-                    Restablecer a 1,00
+                    {selectedCurrency === 'USD' ? '$' : '€'}
                   </Text>
-                </Pressable>
-              </View>
-            )}
 
-            {/* Fila de Input 1: Moneda Extranjera ($ o €) */}
-            <View style={styles.inputsSection}>
+                  <TextInput
+                    style={[styles.amountInput, { color: colors.textPrimary }]}
+                    value={foreignDisplay}
+                    onFocus={() => {
+                      activeInputRef.current = 'FOREIGN';
+                      setFocusedField('FOREIGN');
+                    }}
+                    onBlur={() => {
+                      if (focusedField === 'FOREIGN') setFocusedField(null);
+                    }}
+                    onChangeText={handleForeignChange}
+                    keyboardType="numeric"
+                    placeholder="0,00"
+                    placeholderTextColor={colors.textMuted}
+                    selectTextOnFocus
+                    maxLength={20}
+                  />
+
+                  <TouchableOpacity
+                    onPress={() =>
+                      handleCopy(
+                        foreignDisplay,
+                        selectedCurrency === 'USD' ? 'USD' : 'EUR',
+                        'FOREIGN'
+                      )
+                    }
+                    activeOpacity={0.5}
+                    style={[
+                      styles.copyButton,
+                      copiedField === 'FOREIGN' && styles.copyButtonActive,
+                    ]}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <MaterialCommunityIcons
+                      name={
+                        copiedField === 'FOREIGN'
+                          ? 'check-bold'
+                          : 'content-copy'
+                      }
+                      size={22}
+                      color={
+                        copiedField === 'FOREIGN'
+                          ? colors.accentGreen
+                          : colors.textMuted
+                      }
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                {/* Fila de Input 2: Bolívares (Bs) */}
+                <View
+                  style={[
+                    styles.inputFieldContainer,
+                    {
+                      borderBottomColor:
+                        focusedField === 'VES'
+                          ? colors.inputUnderlineActive
+                          : colors.inputUnderline,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.currencySymbol,
+                      { color: colors.textPrimary },
+                    ]}
+                  >
+                    Bs
+                  </Text>
+
+                  <TextInput
+                    style={[styles.amountInput, { color: colors.textPrimary }]}
+                    value={vesDisplay}
+                    onFocus={() => {
+                      activeInputRef.current = 'VES';
+                      setFocusedField('VES');
+                    }}
+                    onBlur={() => {
+                      if (focusedField === 'VES') setFocusedField(null);
+                    }}
+                    onChangeText={handleVesChange}
+                    keyboardType="numeric"
+                    placeholder="0,00"
+                    placeholderTextColor={colors.textMuted}
+                    selectTextOnFocus
+                    maxLength={22}
+                  />
+
+                  <TouchableOpacity
+                    onPress={() => handleCopy(vesDisplay, 'Bs', 'VES')}
+                    activeOpacity={0.5}
+                    style={[
+                      styles.copyButton,
+                      copiedField === 'VES' && styles.copyButtonActive,
+                    ]}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <MaterialCommunityIcons
+                      name={
+                        copiedField === 'VES' ? 'check-bold' : 'content-copy'
+                      }
+                      size={22}
+                      color={
+                        copiedField === 'VES'
+                          ? colors.accentGreen
+                          : colors.textMuted
+                      }
+                    />
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Barra de Tendencia (Flecha + Variación en Bs y %) */}
               <View
                 style={[
-                  styles.inputFieldContainer,
+                  styles.infoPillBar,
                   {
-                    borderBottomColor:
-                      focusedField === 'FOREIGN'
-                        ? colors.inputUnderlineActive
-                        : colors.inputUnderline,
+                    backgroundColor: colors.elevatedPill,
+                    borderColor: colors.elevatedPillBorder,
                   },
                 ]}
               >
-                <Text
-                  style={[styles.currencySymbol, { color: colors.textPrimary }]}
-                >
-                  {selectedCurrency === 'USD' ? '$' : '€'}
-                </Text>
-
-                <TextInput
-                  style={[styles.amountInput, { color: colors.textPrimary }]}
-                  value={foreignDisplay}
-                  onFocus={() => {
-                    activeInputRef.current = 'FOREIGN';
-                    setFocusedField('FOREIGN');
-                  }}
-                  onBlur={() => {
-                    if (focusedField === 'FOREIGN') setFocusedField(null);
-                  }}
-                  onChangeText={handleForeignChange}
-                  keyboardType="numeric"
-                  placeholder="0,00"
-                  placeholderTextColor={colors.textMuted}
-                  selectTextOnFocus
-                  maxLength={20}
+                <Feather
+                  name={trendIcon}
+                  size={18}
+                  color={trendColor}
+                  style={styles.trendArrowIcon}
                 />
-
-                <TouchableOpacity
-                  onPress={() =>
-                    handleCopy(
-                      foreignDisplay,
-                      selectedCurrency === 'USD' ? 'USD' : 'EUR',
-                      'FOREIGN'
-                    )
-                  }
-                  activeOpacity={0.5}
-                  style={[
-                    styles.copyButton,
-                    copiedField === 'FOREIGN' && styles.copyButtonActive,
-                  ]}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <MaterialCommunityIcons
-                    name={
-                      copiedField === 'FOREIGN'
-                        ? 'check-bold'
-                        : 'content-copy'
-                    }
-                    size={22}
-                    color={
-                      copiedField === 'FOREIGN'
-                        ? colors.accentGreen
-                        : colors.textMuted
-                    }
-                  />
-                </TouchableOpacity>
+                <Text style={[styles.trendValueText, { color: trendColor }]}>
+                  {formattedDiff}
+                </Text>
               </View>
 
-              {/* Fila de Input 2: Bolívares (Bs) */}
-              <View
+              {/* Barra de Fecha Valor + Icono de Calendario Desplegable */}
+              <TouchableOpacity
+                activeOpacity={0.75}
+                onPress={handleToggleCalendar}
                 style={[
-                  styles.inputFieldContainer,
+                  styles.infoPillBar,
+                  styles.datePillBar,
                   {
-                    borderBottomColor:
-                      focusedField === 'VES'
-                        ? colors.inputUnderlineActive
-                        : colors.inputUnderline,
-                  },
-                ]}
-              >
-                <Text
-                  style={[styles.currencySymbol, { color: colors.textPrimary }]}
-                >
-                  Bs
-                </Text>
-
-                <TextInput
-                  style={[styles.amountInput, { color: colors.textPrimary }]}
-                  value={vesDisplay}
-                  onFocus={() => {
-                    activeInputRef.current = 'VES';
-                    setFocusedField('VES');
-                  }}
-                  onBlur={() => {
-                    if (focusedField === 'VES') setFocusedField(null);
-                  }}
-                  onChangeText={handleVesChange}
-                  keyboardType="numeric"
-                  placeholder="0,00"
-                  placeholderTextColor={colors.textMuted}
-                  selectTextOnFocus
-                  maxLength={22}
-                />
-
-                <TouchableOpacity
-                  onPress={() => handleCopy(vesDisplay, 'Bs', 'VES')}
-                  activeOpacity={0.5}
-                  style={[
-                    styles.copyButton,
-                    copiedField === 'VES' && styles.copyButtonActive,
-                  ]}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <MaterialCommunityIcons
-                    name={
-                      copiedField === 'VES' ? 'check-bold' : 'content-copy'
-                    }
-                    size={22}
-                    color={
-                      copiedField === 'VES'
-                        ? colors.accentGreen
-                        : colors.textMuted
-                    }
-                  />
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Barra de Tendencia (Flecha + Variación en Bs y %) */}
-            <View
-              style={[
-                styles.infoPillBar,
-                {
-                  backgroundColor: colors.elevatedPill,
-                  borderColor: colors.elevatedPillBorder,
-                },
-              ]}
-            >
-              <Feather
-                name={trendIcon}
-                size={18}
-                color={trendColor}
-                style={styles.trendArrowIcon}
-              />
-              <Text style={[styles.trendValueText, { color: trendColor }]}>
-                {formattedDiff}
-              </Text>
-            </View>
-
-            {/* Barra de Fecha Valor + Icono de Calendario (Al tocar alterna entre Tasa Vigente y Tasa Previa del Historial) */}
-            <TouchableOpacity
-              activeOpacity={0.75}
-              onPress={() => {
-                if (ratesData.previousDateFormatted) {
-                  setRateMode((prev) =>
-                    prev === 'CURRENT' ? 'PREVIOUS' : 'CURRENT'
-                  );
-                }
-              }}
-              style={[
-                styles.infoPillBar,
-                styles.datePillBar,
-                {
-                  backgroundColor: colors.elevatedPill,
-                  borderColor:
-                    rateMode === 'PREVIOUS'
+                    backgroundColor: colors.elevatedPill,
+                    borderColor: calendarOpen
                       ? colors.accentGreen
                       : colors.elevatedPillBorder,
-                },
-              ]}
-            >
-              <Text style={[styles.dateText, { color: colors.textPrimary }]}>
-                {displayedDate}
-              </Text>
-              <MaterialCommunityIcons
-                name="calendar-month-outline"
-                size={19}
-                color={
-                  rateMode === 'PREVIOUS'
-                    ? colors.accentGreen
-                    : colors.textMuted
-                }
-                style={styles.calendarIcon}
-              />
-            </TouchableOpacity>
-          </View>
-
-          {/* Pie de Tarjeta Minimalista (Estilo Imagen 3: barra inferior limpia con historial previo y atajo rápido) */}
-          <View style={styles.cardFooterMeta}>
-            <View style={styles.footerSourceGroup}>
-              <View
-                style={[
-                  styles.statusDot,
-                  {
-                    backgroundColor: ratesData.isOffline
-                      ? '#F59E0B'
-                      : colors.accentGreen,
                   },
                 ]}
-              />
-              <Text
-                style={[styles.footerMetaText, { color: colors.textSecondary }]}
               >
-                Previa:{' '}
-                {formatCurrencyDisplay(
-                  selectedCurrency === 'USD'
-                    ? ratesData.previousUsd
-                    : ratesData.previousEur
-                )}{' '}
-                Bs
-              </Text>
+                <Text style={[styles.dateText, { color: colors.textPrimary }]}>
+                  {ratesData.formattedDate}
+                </Text>
+                <MaterialCommunityIcons
+                  name={
+                    calendarOpen ? 'calendar-check' : 'calendar-month-outline'
+                  }
+                  size={20}
+                  color={
+                    calendarOpen ? colors.accentGreen : colors.textMuted
+                  }
+                  style={styles.calendarIcon}
+                />
+                <Feather
+                  name={calendarOpen ? 'chevron-up' : 'chevron-down'}
+                  size={16}
+                  color={calendarOpen ? colors.accentGreen : colors.textMuted}
+                />
+              </TouchableOpacity>
+
+              {/* Calendario Desplegable Interactivo */}
+              <RateCalendarDropdown
+                visible={calendarOpen}
+                selectedIsoDate={
+                  ratesData.selectedCalendarDate || ratesData.isoDate
+                }
+                latestPublishedIso={ratesData.latestPublishedIso}
+                todayIso={ratesData.todayIso}
+                selectedCurrency={selectedCurrency}
+                historyMap={historyMap}
+                colors={colors}
+                onSelectDate={handleSelectDateFromCalendar}
+                onMonthChange={handleCalendarMonthChange}
+                onClose={() => {
+                  LayoutAnimation.configureNext(
+                    LayoutAnimation.Presets.easeInEaseOut
+                  );
+                  setCalendarOpen(false);
+                }}
+              />
             </View>
 
-            <TouchableOpacity
-              onPress={handleResetToOne}
-              activeOpacity={0.65}
-              style={styles.resetChip}
-            >
-              <Feather
-                name="rotate-ccw"
-                size={12}
-                color={colors.textSecondary}
-              />
-              <Text
-                style={[styles.resetChipText, { color: colors.textSecondary }]}
+            {/* Pie de Tarjeta Minimalista (Estilo Imagen 3) */}
+            <View style={styles.cardFooterMeta}>
+              <View style={styles.footerSourceGroup}>
+                <View
+                  style={[
+                    styles.statusDot,
+                    {
+                      backgroundColor: ratesData.isOffline
+                        ? '#F59E0B'
+                        : colors.accentGreen,
+                    },
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.footerMetaText,
+                    { color: colors.textSecondary },
+                  ]}
+                >
+                  Tasa {selectedCurrency}: {formatCurrencyDisplay(activeRate)} Bs
+                </Text>
+              </View>
+
+              <TouchableOpacity
+                onPress={handleResetToOne}
+                activeOpacity={0.65}
+                style={styles.resetChip}
               >
-                Base 1,00
-              </Text>
-            </TouchableOpacity>
+                <Feather
+                  name="rotate-ccw"
+                  size={12}
+                  color={colors.textSecondary}
+                />
+                <Text
+                  style={[
+                    styles.resetChipText,
+                    { color: colors.textSecondary },
+                  ]}
+                >
+                  Base 1,00
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
-        </View>
+        </ScrollView>
 
         {/* Toast Flotante de Copiado */}
         <Animated.View
@@ -818,9 +882,12 @@ export default function CalculatorScreen() {
 const styles = StyleSheet.create({
   screenContainer: {
     flex: 1,
+  },
+  scrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 20,
     paddingTop: Platform.OS === 'ios' ? 64 : 48,
-    paddingBottom: 28,
+    paddingBottom: 32,
     justifyContent: 'center',
   },
   headerBar: {
@@ -925,7 +992,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.18,
     shadowRadius: 16,
     elevation: 10,
-    minWidth: 205,
+    minWidth: 215,
   },
   popoverItem: {
     flexDirection: 'row',
@@ -985,7 +1052,7 @@ const styles = StyleSheet.create({
   datePillBar: {
     justifyContent: 'center',
     marginBottom: 0,
-    gap: 10,
+    gap: 8,
   },
   trendArrowIcon: {
     marginLeft: 4,

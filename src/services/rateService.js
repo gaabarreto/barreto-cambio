@@ -2,7 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { safeRound } from '../utils/currencyFormatter';
 
 const STORAGE_KEYS = {
-  CACHED_RATES: '@barreto_cambio_rates_v2',
+  CACHED_RATES: '@barreto_cambio_rates_v3',
+  CACHED_HISTORY: '@barreto_cambio_history_v3',
   LAST_INPUT_STATE: '@barreto_cambio_last_input_v1',
 };
 
@@ -10,12 +11,18 @@ const ENDPOINTS = {
   PRIMARY: 'https://datos.cromstudio.com.ve/tasa',
   BACKUP_1: 'https://bcv.today/api/v1/rate.json',
   BACKUP_2: 'https://rates.dolarvzla.com/bcv/previous.json',
+  DOLARVZLA_CURRENT: 'https://rates.dolarvzla.com/bcv/current.json',
+  BCV_TODAY_HISTORY: 'https://bcv.today/api/v1/history.json',
+  dolarVzlaMonthList: (year, month) =>
+    `https://rates.dolarvzla.com/bcv/${Number(year)}/${Number(month)}/list.json`,
+  dolarVzlaYearList: (year) =>
+    `https://rates.dolarvzla.com/bcv/${Number(year)}/list.json`,
 };
 
 const FETCH_TIMEOUT_MS = 6500;
 
 /**
- * Fetch con timeout abortable y cache-busting para garantizar datos frescos día con día
+ * Fetch con timeout abortable y cache-busting para datos siempre frescos
  */
 const fetchWithTimeout = async (url, timeout = FETCH_TIMEOUT_MS) => {
   const controller = new AbortController();
@@ -62,7 +69,6 @@ const toSafeFloat = (val) => {
 
 /**
  * Extrae una fecha canónica ISO (YYYY-MM-DD) desde cualquier formato ("2026-11-06" o "Miércoles, 04 Noviembre 2026")
- * para poder comparar qué API tiene la tasa más reciente del BCV.
  */
 export const extractIsoDate = (rawDate) => {
   if (!rawDate) return null;
@@ -142,132 +148,9 @@ export const formatSpanishDate = (rawDate) => {
 };
 
 /**
- * Adaptador defensivo 1: API Principal (https://datos.cromstudio.com.ve/tasa)
- * Estructura: { fuente: "BCV_DB", fecha_valor: "Miércoles, 04 Noviembre  2026", tasas: { USD: 893.2173, EUR: 999.7691 } }
+ * Calcula tendencia (diferencia en Bs y %) entre dos cortes de tasa
  */
-const parsePrimaryApi = (data) => {
-  try {
-    const usd = toSafeFloat(
-      data?.tasas?.USD ?? data?.tasas?.usd ?? data?.USD ?? data?.usd
-    );
-    const eur = toSafeFloat(
-      data?.tasas?.EUR ?? data?.tasas?.eur ?? data?.EUR ?? data?.eur
-    );
-    if (!usd || !eur) return null;
-
-    const rawDate = data?.fecha_valor || data?.actualizado_el;
-    const isoDate = extractIsoDate(data?.fecha_valor) || extractIsoDate(data?.actualizado_el) || '1970-01-01';
-
-    return {
-      usd,
-      eur,
-      isoDate,
-      formattedDate: formatSpanishDate(rawDate),
-      source: 'CromStudio BCV',
-      priority: 1,
-    };
-  } catch (_e) {
-    return null;
-  }
-};
-
-/**
- * Adaptador defensivo 2: API Respaldo 1 (https://bcv.today/api/v1/rate.json)
- * Estructura: { USD: 896.1225, EUR: 1004.95657762, effective_date: "2026-11-06", date: "2026-11-08" }
- */
-const parseBackup1Api = (data) => {
-  try {
-    const usd = toSafeFloat(data?.USD ?? data?.usd ?? data?.rates?.USD);
-    const eur = toSafeFloat(data?.EUR ?? data?.eur ?? data?.rates?.EUR);
-    if (!usd || !eur) return null;
-
-    const rawDate = data?.effective_date || data?.date || data?.updated_at;
-    const isoDate =
-      extractIsoDate(data?.effective_date) ||
-      extractIsoDate(data?.date) ||
-      extractIsoDate(data?.updated_at) ||
-      '1970-01-01';
-
-    return {
-      usd,
-      eur,
-      isoDate,
-      formattedDate: formatSpanishDate(rawDate),
-      source: 'BCV Today',
-      priority: 2,
-    };
-  } catch (_e) {
-    return null;
-  }
-};
-
-/**
- * Adaptador defensivo 3: API Respaldo 2 con Historial (https://rates.dolarvzla.com/bcv/previous.json)
- * Estructura:
- * {
- *   current: { date: "2026-11-06", usd: 896.1225, eur: 1004.95657762 },
- *   previous: { date: "2026-11-05", usd: 894.8876, eur: 1006.03263992 },
- *   changePercentage: { usd: 0.1379949839510487, eur: -0.10696097296461061 }
- * }
- */
-const parseBackup2Api = (data) => {
-  try {
-    const currentUsd = toSafeFloat(
-      data?.current?.usd ?? data?.current?.USD ?? data?.usd
-    );
-    const currentEur = toSafeFloat(
-      data?.current?.eur ?? data?.current?.EUR ?? data?.eur
-    );
-    if (!currentUsd || !currentEur) return null;
-
-    const prevUsd = toSafeFloat(data?.previous?.usd ?? data?.previous?.USD);
-    const prevEur = toSafeFloat(data?.previous?.eur ?? data?.previous?.EUR);
-    const prevDateIso = extractIsoDate(data?.previous?.date);
-
-    const usdDiff = prevUsd ? safeRound(currentUsd - prevUsd, 2) : 0;
-    const eurDiff = prevEur ? safeRound(currentEur - prevEur, 2) : 0;
-
-    const usdPct =
-      typeof data?.changePercentage?.usd === 'number'
-        ? safeRound(data.changePercentage.usd, 2)
-        : prevUsd
-          ? safeRound(((currentUsd - prevUsd) / prevUsd) * 100, 2)
-          : 0;
-
-    const eurPct =
-      typeof data?.changePercentage?.eur === 'number'
-        ? safeRound(data.changePercentage.eur, 2)
-        : prevEur
-          ? safeRound(((currentEur - prevEur) / prevEur) * 100, 2)
-          : 0;
-
-    const rawDate = data?.current?.date;
-    const isoDate = extractIsoDate(rawDate) || '1970-01-01';
-
-    return {
-      usd: currentUsd,
-      eur: currentEur,
-      previousUsd: prevUsd,
-      previousEur: prevEur,
-      previousDateFormatted: prevDateIso ? formatSpanishDate(prevDateIso) : null,
-      trend: {
-        USD: { diff: usdDiff, pct: usdPct },
-        EUR: { diff: eurDiff, pct: eurPct },
-      },
-      isoDate,
-      formattedDate: formatSpanishDate(rawDate),
-      source: 'DolarVzla BCV',
-      priority: 3,
-    };
-  } catch (_e) {
-    return null;
-  }
-};
-
-/**
- * Calcula tendencia contra la tasa previa o la última guardada en caché
- */
-const computeTrend = (currentUsd, currentEur, prevUsd, prevEur) => {
+export const computeTrend = (currentUsd, currentEur, prevUsd, prevEur) => {
   const baseUsd = prevUsd && prevUsd > 0 ? prevUsd : currentUsd;
   const baseEur = prevEur && prevEur > 0 ? prevEur : currentEur;
 
@@ -286,111 +169,329 @@ const computeTrend = (currentUsd, currentEur, prevUsd, prevEur) => {
 };
 
 /**
- * Consulta las 3 APIs y garantiza que SIEMPRE se utilice la tasa con la fecha de vigencia
- * más reciente del BCV (por ejemplo, si CromStudio se quedó congelada en el miércoles 04/11
- * pero BCV Today y DolarVzla ya tienen la tasa del viernes 06/11, selecciona automáticamente
- * la del viernes 06/11 y extrae el historial `current` vs `previous` de `rates.dolarvzla.com`).
+ * Adaptador defensivo 1: API Principal (https://datos.cromstudio.com.ve/tasa)
+ */
+const parsePrimaryApi = (data) => {
+  try {
+    const usd = toSafeFloat(
+      data?.tasas?.USD ?? data?.tasas?.usd ?? data?.USD ?? data?.usd
+    );
+    const eur = toSafeFloat(
+      data?.tasas?.EUR ?? data?.tasas?.eur ?? data?.EUR ?? data?.eur
+    );
+    if (!usd || !eur) return null;
+
+    const rawDate = data?.fecha_valor || data?.actualizado_el;
+    const isoDate =
+      extractIsoDate(data?.fecha_valor) ||
+      extractIsoDate(data?.actualizado_el) ||
+      null;
+    if (!isoDate) return null;
+
+    return [{ isoDate, usd, eur, source: 'CromStudio BCV' }];
+  } catch (_e) {
+    return null;
+  }
+};
+
+/**
+ * Adaptador defensivo 2: API Respaldo 1 (https://bcv.today/api/v1/rate.json)
+ */
+const parseBackup1Api = (data) => {
+  try {
+    const usd = toSafeFloat(data?.USD ?? data?.usd ?? data?.rates?.USD);
+    const eur = toSafeFloat(data?.EUR ?? data?.eur ?? data?.rates?.EUR);
+    if (!usd || !eur) return null;
+
+    const isoDate =
+      extractIsoDate(data?.effective_date) ||
+      extractIsoDate(data?.date) ||
+      extractIsoDate(data?.updated_at) ||
+      null;
+    if (!isoDate) return null;
+
+    return [{ isoDate, usd, eur, source: 'BCV Today' }];
+  } catch (_e) {
+    return null;
+  }
+};
+
+/**
+ * Adaptador defensivo 3: Snapshot con current + previous (previous.json y current.json de DolarVzla)
+ */
+const parseSnapshotApi = (data) => {
+  try {
+    const entries = [];
+    const curUsd = toSafeFloat(data?.current?.usd ?? data?.current?.USD);
+    const curEur = toSafeFloat(data?.current?.eur ?? data?.current?.EUR);
+    const curIso = extractIsoDate(data?.current?.date);
+
+    if (curUsd && curEur && curIso) {
+      entries.push({
+        isoDate: curIso,
+        usd: curUsd,
+        eur: curEur,
+        source: 'DolarVzla BCV',
+      });
+    }
+
+    const prevUsd = toSafeFloat(data?.previous?.usd ?? data?.previous?.USD);
+    const prevEur = toSafeFloat(data?.previous?.eur ?? data?.previous?.EUR);
+    const prevIso = extractIsoDate(data?.previous?.date);
+
+    if (prevUsd && prevEur && prevIso) {
+      entries.push({
+        isoDate: prevIso,
+        usd: prevUsd,
+        eur: prevEur,
+        source: 'DolarVzla BCV',
+      });
+    }
+
+    return entries.length > 0 ? entries : null;
+  } catch (_e) {
+    return null;
+  }
+};
+
+/**
+ * Adaptador defensivo para listas históricas (rates.dolarvzla.com/bcv/{year}/list.json o bcv.today/api/v1/history.json)
+ */
+const parseHistoryList = (list) => {
+  try {
+    if (!Array.isArray(list)) return [];
+    const results = [];
+    for (const item of list) {
+      const usd = toSafeFloat(item?.usd ?? item?.USD);
+      const eur = toSafeFloat(item?.eur ?? item?.EUR);
+      const isoDate =
+        extractIsoDate(item?.date) || extractIsoDate(item?.effective_date);
+      if (usd && eur && isoDate) {
+        results.push({
+          isoDate,
+          usd,
+          eur,
+          source: 'Historial BCV',
+        });
+      }
+    }
+    return results;
+  } catch (_e) {
+    return [];
+  }
+};
+
+/**
+ * Construye un mapa indexado por fecha YYYY-MM-DD con su variación exacta respecto a la jornada hábil previa
+ */
+export const buildHistoryIndex = (entriesArray, existingMap = {}) => {
+  const merged = { ...existingMap };
+
+  for (const item of entriesArray) {
+    if (!item?.isoDate || !item?.usd || !item?.eur) continue;
+    merged[item.isoDate] = {
+      isoDate: item.isoDate,
+      usd: item.usd,
+      eur: item.eur,
+      formattedDate: formatSpanishDate(item.isoDate),
+      source: item.source || 'BCV Oficial',
+    };
+  }
+
+  // Ordenar todas las fechas ascendentemente para calcular la variación de cada día contra su día hábil inmediato anterior
+  const sortedDates = Object.keys(merged).sort((a, b) => a.localeCompare(b));
+
+  for (let i = 0; i < sortedDates.length; i++) {
+    const iso = sortedDates[i];
+    const currentEntry = merged[iso];
+    const prevEntry = i > 0 ? merged[sortedDates[i - 1]] : currentEntry;
+
+    currentEntry.previousIsoDate = prevEntry.isoDate;
+    currentEntry.previousUsd = prevEntry.usd;
+    currentEntry.previousEur = prevEntry.eur;
+    currentEntry.trend = computeTrend(
+      currentEntry.usd,
+      currentEntry.eur,
+      prevEntry.usd,
+      prevEntry.eur
+    );
+  }
+
+  return merged;
+};
+
+/**
+ * Obtiene la tasa que aplica para cualquier fecha calendario YYYY-MM-DD:
+ * - Si esa fecha exacta tiene publicación BCV, devuelve esa publicación.
+ * - Si es fin de semana o feriado bancario (sin publicación propia), busca la tasa vigente publicada inmediata anterior,
+ *   o si ya existe tasa publicada para el lunes siguiente, permite seleccionarla directamente.
+ */
+export const resolveRateForDate = (isoDate, historyMap) => {
+  if (!historyMap || Object.keys(historyMap).length === 0) return null;
+  if (historyMap[isoDate]) {
+    return {
+      ...historyMap[isoDate],
+      selectedCalendarDate: isoDate,
+      selectedCalendarFormatted: formatSpanishDate(isoDate),
+    };
+  }
+
+  // Si el usuario toca un sábado/domingo/feriado sin tasa propia, buscar la última tasa publicada <= isoDate
+  const allDatesDesc = Object.keys(historyMap).sort((a, b) =>
+    b.localeCompare(a)
+  );
+  const effectiveIso = allDatesDesc.find((d) => d <= isoDate) || allDatesDesc[0];
+  const entry = historyMap[effectiveIso];
+  if (!entry) return null;
+
+  return {
+    ...entry,
+    selectedCalendarDate: isoDate,
+    selectedCalendarFormatted: formatSpanishDate(isoDate),
+  };
+};
+
+/**
+ * Carga bajo demanda el historial de un mes/año específico si el usuario navega a meses anteriores en el calendario
+ */
+export const fetchMonthHistoryIfNeeded = async (year, month, currentHistoryMap) => {
+  try {
+    const rawList = await fetchWithTimeout(
+      ENDPOINTS.dolarVzlaMonthList(year, month)
+    );
+    const parsed = parseHistoryList(rawList);
+    if (parsed.length > 0) {
+      const updatedMap = buildHistoryIndex(parsed, currentHistoryMap);
+      await saveCachedHistory(updatedMap);
+      return updatedMap;
+    }
+  } catch (_err) {
+    // Silencioso
+  }
+  return currentHistoryMap;
+};
+
+/**
+ * Consulta en cascada las APIs principales y además sincroniza el historial completo del año
+ * para poblar el calendario desplegable y mostrar la tasa vigente del día.
  */
 export const fetchRatesInCascade = async () => {
-  const cached = await loadCachedRates();
+  const [cachedRates, cachedHistory] = await Promise.all([
+    loadCachedRates(),
+    loadCachedHistory(),
+  ]);
 
-  // Consultamos las 3 fuentes en paralelo de forma resiliente para comparar vigencia y obtener el historial
-  const [resPrimary, resBackup1, resBackup2] = await Promise.allSettled([
+  const currentYear = new Date().getFullYear();
+
+  const [
+    resPrimary,
+    resBackup1,
+    resBackup2,
+    resCurrent,
+    resYearHistory,
+    resBcvTodayHistory,
+  ] = await Promise.allSettled([
     fetchWithTimeout(ENDPOINTS.PRIMARY),
     fetchWithTimeout(ENDPOINTS.BACKUP_1),
     fetchWithTimeout(ENDPOINTS.BACKUP_2),
+    fetchWithTimeout(ENDPOINTS.DOLARVZLA_CURRENT),
+    fetchWithTimeout(ENDPOINTS.dolarVzlaYearList(currentYear)),
+    fetchWithTimeout(ENDPOINTS.BCV_TODAY_HISTORY),
   ]);
 
-  const parsedPrimary =
-    resPrimary.status === 'fulfilled' ? parsePrimaryApi(resPrimary.value) : null;
-  const parsedBackup1 =
-    resBackup1.status === 'fulfilled' ? parseBackup1Api(resBackup1.value) : null;
-  const parsedBackup2 =
-    resBackup2.status === 'fulfilled' ? parseBackup2Api(resBackup2.value) : null;
+  const collectedEntries = [];
 
-  const candidates = [parsedPrimary, parsedBackup1, parsedBackup2].filter(Boolean);
+  if (resBcvTodayHistory.status === 'fulfilled') {
+    // Tomamos los últimos 120 registros de bcv.today/history.json como respaldo histórico
+    const list = Array.isArray(resBcvTodayHistory.value)
+      ? resBcvTodayHistory.value.slice(-120)
+      : [];
+    collectedEntries.push(...parseHistoryList(list));
+  }
 
-  if (candidates.length > 0) {
-    // Ordenar candidatos por:
-    // 1) Fecha de vigencia más reciente (isoDate descendente: "2026-11-06" > "2026-11-04")
-    // 2) En caso de empate en la misma fecha del día, respetar el orden de prioridad (Principal -> Respaldo 1 -> Respaldo 2)
-    candidates.sort((a, b) => {
-      if (a.isoDate !== b.isoDate) {
-        return b.isoDate.localeCompare(a.isoDate);
-      }
-      return a.priority - b.priority;
-    });
+  if (resYearHistory.status === 'fulfilled') {
+    collectedEntries.push(...parseHistoryList(resYearHistory.value));
+  }
 
-    const freshest = candidates[0];
+  if (resPrimary.status === 'fulfilled') {
+    const p1 = parsePrimaryApi(resPrimary.value);
+    if (p1) collectedEntries.push(...p1);
+  }
 
-    // Determinar tasas previas del historial:
-    // Si Respaldo 2 (DolarVzla) respondió y su fecha coincide con la tasa más reciente, usamos su `previous` oficial
-    let prevUsd = parsedBackup2?.previousUsd;
-    let prevEur = parsedBackup2?.previousEur;
-    let prevDateFormatted = parsedBackup2?.previousDateFormatted || null;
+  if (resBackup1.status === 'fulfilled') {
+    const b1 = parseBackup1Api(resBackup1.value);
+    if (b1) collectedEntries.push(...b1);
+  }
 
-    // Si la tasa más reciente es aún más nueva que el current de Respaldo 2, el current de Respaldo 2 pasa a ser la previa
-    if (
-      parsedBackup2 &&
-      freshest.isoDate > parsedBackup2.isoDate
-    ) {
-      prevUsd = parsedBackup2.usd;
-      prevEur = parsedBackup2.eur;
-      prevDateFormatted = parsedBackup2.formattedDate;
-    }
+  if (resBackup2.status === 'fulfilled') {
+    const b2 = parseSnapshotApi(resBackup2.value);
+    if (b2) collectedEntries.push(...b2);
+  }
 
-    if (!prevUsd || !prevEur) {
-      prevUsd = cached?.previousUsd || cached?.usd || freshest.usd;
-      prevEur = cached?.previousEur || cached?.eur || freshest.eur;
-    }
+  if (resCurrent.status === 'fulfilled') {
+    const cur = parseSnapshotApi(resCurrent.value);
+    if (cur) collectedEntries.push(...cur);
+  }
 
-    // Si la fecha coincide con Respaldo 2 y éste ya trae changePercentage exacto del BCV, lo usamos
-    const trend =
-      parsedBackup2 && parsedBackup2.isoDate === freshest.isoDate && parsedBackup2.trend
-        ? parsedBackup2.trend
-        : computeTrend(freshest.usd, freshest.eur, prevUsd, prevEur);
+  if (collectedEntries.length > 0) {
+    const historyMap = buildHistoryIndex(
+      collectedEntries,
+      cachedHistory || {}
+    );
+    await saveCachedHistory(historyMap);
+
+    const allDatesDesc = Object.keys(historyMap).sort((a, b) =>
+      b.localeCompare(a)
+    );
+
+    // Determinar la fecha de hoy en hora de Venezuela (UTC-4)
+    const nowVzla = new Date(Date.now() - 4 * 60 * 60 * 1000);
+    const todayIso = nowVzla.toISOString().slice(0, 10);
+
+    // Seleccionar por defecto la tasa vigente de hoy (o si hoy es fin de semana y ya está publicada la del lunes, mostrar la más reciente disponible; y en el calendario todas las fechas son seleccionables)
+    const defaultActiveIso =
+      allDatesDesc.find((d) => d <= todayIso) || allDatesDesc[0];
+    const latestPublishedIso = allDatesDesc[0];
+
+    const defaultEntry =
+      historyMap[defaultActiveIso] || historyMap[latestPublishedIso];
 
     const finalPayload = {
-      usd: freshest.usd,
-      eur: freshest.eur,
-      previousUsd: prevUsd,
-      previousEur: prevEur,
-      previousDateFormatted: prevDateFormatted,
-      trend,
-      isoDate: freshest.isoDate,
-      formattedDate: freshest.formattedDate,
-      source: freshest.source,
+      ...defaultEntry,
+      latestPublishedIso,
+      todayIso,
       updatedAt: new Date().toISOString(),
       isOffline: false,
     };
 
     await saveCachedRates(finalPayload);
-    return finalPayload;
-  }
-
-  // Fallback Offline-First si no hay conexión a ninguna de las 3 APIs
-  if (cached) {
     return {
-      ...cached,
-      isOffline: true,
+      activeRateData: finalPayload,
+      historyMap,
     };
   }
 
+  // Fallback Offline-First si no hay internet
+  const fallbackHistory = cachedHistory || buildHistoryIndex([
+    { isoDate: '2026-11-04', usd: 893.2173, eur: 999.7692 },
+    { isoDate: '2026-11-05', usd: 894.8876, eur: 1006.0326 },
+    { isoDate: '2026-11-06', usd: 896.1225, eur: 1004.9566 },
+    { isoDate: '2026-11-09', usd: 897.5383, eur: 1001.186 },
+  ]);
+
+  const fallbackActive = cachedRates
+    ? { ...cachedRates, isOffline: true }
+    : {
+        ...fallbackHistory['2026-11-06'],
+        latestPublishedIso: '2026-11-09',
+        todayIso: '2026-11-08',
+        updatedAt: new Date().toISOString(),
+        isOffline: true,
+      };
+
   return {
-    usd: 896.1225,
-    eur: 1004.9566,
-    previousUsd: 894.8876,
-    previousEur: 1006.0326,
-    previousDateFormatted: 'Jueves, 05/11/2026',
-    trend: {
-      USD: { diff: 1.23, pct: 0.14 },
-      EUR: { diff: -1.08, pct: -0.11 },
-    },
-    isoDate: '2026-11-06',
-    formattedDate: 'Viernes, 06/11/2026',
-    source: 'Memoria Local',
-    updatedAt: new Date().toISOString(),
-    isOffline: true,
+    activeRateData: fallbackActive,
+    historyMap: fallbackHistory,
   };
 };
 
@@ -400,9 +501,7 @@ export const saveCachedRates = async (ratesPayload) => {
       STORAGE_KEYS.CACHED_RATES,
       JSON.stringify(ratesPayload)
     );
-  } catch (_err) {
-    // Silencioso
-  }
+  } catch (_err) {}
 };
 
 export const loadCachedRates = async () => {
@@ -414,6 +513,25 @@ export const loadCachedRates = async () => {
       return parsed;
     }
     return null;
+  } catch (_err) {
+    return null;
+  }
+};
+
+export const saveCachedHistory = async (historyMap) => {
+  try {
+    await AsyncStorage.setItem(
+      STORAGE_KEYS.CACHED_HISTORY,
+      JSON.stringify(historyMap)
+    );
+  } catch (_err) {}
+};
+
+export const loadCachedHistory = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_KEYS.CACHED_HISTORY);
+    if (!raw) return null;
+    return JSON.parse(raw);
   } catch (_err) {
     return null;
   }
@@ -433,9 +551,7 @@ export const saveUserSessionState = async ({
         lastEditedField: lastEditedField || 'FOREIGN',
       })
     );
-  } catch (_err) {
-    // Silencioso
-  }
+  } catch (_err) {}
 };
 
 export const loadUserSessionState = async () => {
