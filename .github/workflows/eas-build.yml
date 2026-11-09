@@ -28,5 +28,5 @@ jobs:
 
       - name: Trigger EAS Android APK Build (preview profile)
         env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN || 'hLBc1m3dt3FBc8IUZ96ucgVpURAngNWkG_DK9TFM' }}
         run: eas build --platform android --profile preview --non-interactive --no-wait

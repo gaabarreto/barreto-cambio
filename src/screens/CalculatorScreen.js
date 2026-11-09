@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   Animated,
   Platform,
+  AppState,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Clipboard from 'expo-clipboard';
@@ -36,10 +37,16 @@ export default function CalculatorScreen() {
   const [selectedCurrency, setSelectedCurrency] = useState('USD');
   const [menuOpen, setMenuOpen] = useState(false);
 
-  // Estado de tasas y metadatos
+  // Permitir alternar entre la tasa vigente del día ("CURRENT") y la tasa previa del historial ("PREVIOUS")
+  const [rateMode, setRateMode] = useState('CURRENT');
+
+  // Estado de tasas y metadatos (inicializado con el corte vigente del BCV)
   const [ratesData, setRatesData] = useState({
     usd: 896.1225,
     eur: 1004.9566,
+    previousUsd: 894.8876,
+    previousEur: 1006.0326,
+    previousDateFormatted: 'Jueves, 05/11/2026',
     trend: {
       USD: { diff: 1.23, pct: 0.14 },
       EUR: { diff: -1.08, pct: -0.11 },
@@ -66,9 +73,20 @@ export default function CalculatorScreen() {
   const toastOpacity = useRef(new Animated.Value(0)).current;
   const [toastMessage, setToastMessage] = useState('');
 
-  // Tasa activa según la divisa seleccionada
+  // Tasa activa según la divisa seleccionada y si está viendo la tasa actual o la previa del historial
   const activeRate =
-    selectedCurrency === 'USD' ? ratesData.usd : ratesData.eur;
+    rateMode === 'PREVIOUS'
+      ? selectedCurrency === 'USD'
+        ? ratesData.previousUsd || ratesData.usd
+        : ratesData.previousEur || ratesData.eur
+      : selectedCurrency === 'USD'
+        ? ratesData.usd
+        : ratesData.eur;
+
+  const displayedDate =
+    rateMode === 'PREVIOUS' && ratesData.previousDateFormatted
+      ? `${ratesData.previousDateFormatted} (Previa)`
+      : ratesData.formattedDate;
 
   // Mostrar notificación minimalista al copiar
   const triggerToast = useCallback(
@@ -94,12 +112,11 @@ export default function CalculatorScreen() {
     [toastOpacity]
   );
 
-  // Sincronización inicial Offline-First + Consulta en cascada
+  // Sincronización inicial Offline-First + Consulta inteligente de la tasa más reciente + Auto-actualización al volver a la app
   useEffect(() => {
     let isMounted = true;
 
     const initialize = async () => {
-      // 1. Cargar caché local inmediatamente para respuesta instantánea
       const [cachedRates, savedSession] = await Promise.all([
         loadCachedRates(),
         loadUserSessionState(),
@@ -128,7 +145,7 @@ export default function CalculatorScreen() {
         }
       }
 
-      // 2. Consultar APIs en cascada en segundo plano
+      // Consultar las 3 APIs y seleccionar la de fecha más reciente
       const freshRates = await fetchRatesInCascade();
       if (isMounted && freshRates) {
         setRatesData(freshRates);
@@ -142,12 +159,24 @@ export default function CalculatorScreen() {
     };
 
     initialize();
+
+    // Actualizar automáticamente las tasas cada vez que el usuario abre la app del segundo plano (día con día)
+    const subscription = AppState.addEventListener('change', async (nextAppState) => {
+      if (nextAppState === 'active') {
+        const latestRates = await fetchRatesInCascade();
+        if (isMounted && latestRates) {
+          setRatesData(latestRates);
+        }
+      }
+    });
+
     return () => {
       isMounted = false;
+      subscription.remove();
     };
   }, []);
 
-  // Recalcular automáticamente cuando cambia la divisa (USD <-> EUR) o se actualiza la tasa
+  // Recalcular automáticamente cuando cambia la divisa (USD <-> EUR), el modo (Actual <-> Previa) o se actualiza la tasa
   useEffect(() => {
     if (!activeRate || activeRate <= 0) return;
 
@@ -160,7 +189,7 @@ export default function CalculatorScreen() {
       setVesValue(updatedVes);
       setVesDisplay(formatCurrencyDisplay(updatedVes));
     }
-  }, [selectedCurrency, activeRate]);
+  }, [selectedCurrency, activeRate, rateMode]);
 
   // Manejador de edición en el input de Divisa ($ o €)
   const handleForeignChange = (text) => {
@@ -217,6 +246,7 @@ export default function CalculatorScreen() {
   const handleRefreshRates = async () => {
     if (isRefreshing) return;
     setIsRefreshing(true);
+    setRateMode('CURRENT');
     const fresh = await fetchRatesInCascade();
     if (fresh) {
       setRatesData(fresh);
@@ -258,7 +288,7 @@ export default function CalculatorScreen() {
   const isTrendNegative = currentTrend.diff < 0;
   const trendColor = isTrendNegative ? colors.trendDown : colors.trendUp;
   const trendIcon = isTrendNegative ? 'arrow-down' : 'arrow-up';
-  const formattedDiff = `${currentTrend.diff > 0 ? '' : ''}${currentTrend.diff.toFixed(2)} Bs (${currentTrend.pct.toFixed(2)}%)`;
+  const formattedDiff = `${currentTrend.diff.toFixed(2)} Bs (${currentTrend.pct.toFixed(2)}%)`;
 
   return (
     <TouchableWithoutFeedback
@@ -473,6 +503,41 @@ export default function CalculatorScreen() {
                   </Text>
                 </Pressable>
 
+                {ratesData.previousDateFormatted && (
+                  <Pressable
+                    onPress={() => {
+                      setRateMode((prev) =>
+                        prev === 'CURRENT' ? 'PREVIOUS' : 'CURRENT'
+                      );
+                      setMenuOpen(false);
+                    }}
+                    style={styles.popoverItem}
+                  >
+                    <Feather
+                      name="clock"
+                      size={14}
+                      color={
+                        rateMode === 'PREVIOUS'
+                          ? colors.accentGreen
+                          : colors.textSecondary
+                      }
+                    />
+                    <Text
+                      style={[
+                        styles.popoverItemText,
+                        {
+                          color: colors.textPrimary,
+                          fontWeight: rateMode === 'PREVIOUS' ? '700' : '500',
+                        },
+                      ]}
+                    >
+                      {rateMode === 'PREVIOUS'
+                        ? 'Volver a tasa actual'
+                        : 'Ver tasa jornada previa'}
+                    </Text>
+                  </Pressable>
+                )}
+
                 <Pressable
                   onPress={() => {
                     handleResetToOne();
@@ -646,30 +711,45 @@ export default function CalculatorScreen() {
               </Text>
             </View>
 
-            {/* Barra de Fecha Valor + Icono de Calendario */}
-            <View
+            {/* Barra de Fecha Valor + Icono de Calendario (Al tocar alterna entre Tasa Vigente y Tasa Previa del Historial) */}
+            <TouchableOpacity
+              activeOpacity={0.75}
+              onPress={() => {
+                if (ratesData.previousDateFormatted) {
+                  setRateMode((prev) =>
+                    prev === 'CURRENT' ? 'PREVIOUS' : 'CURRENT'
+                  );
+                }
+              }}
               style={[
                 styles.infoPillBar,
                 styles.datePillBar,
                 {
                   backgroundColor: colors.elevatedPill,
-                  borderColor: colors.elevatedPillBorder,
+                  borderColor:
+                    rateMode === 'PREVIOUS'
+                      ? colors.accentGreen
+                      : colors.elevatedPillBorder,
                 },
               ]}
             >
               <Text style={[styles.dateText, { color: colors.textPrimary }]}>
-                {ratesData.formattedDate}
+                {displayedDate}
               </Text>
               <MaterialCommunityIcons
                 name="calendar-month-outline"
                 size={19}
-                color={colors.textMuted}
+                color={
+                  rateMode === 'PREVIOUS'
+                    ? colors.accentGreen
+                    : colors.textMuted
+                }
                 style={styles.calendarIcon}
               />
-            </View>
+            </TouchableOpacity>
           </View>
 
-          {/* Pie de Tarjeta Minimalista (Estilo Imagen 3: barra inferior limpia con metadatos y atajo rápido) */}
+          {/* Pie de Tarjeta Minimalista (Estilo Imagen 3: barra inferior limpia con historial previo y atajo rápido) */}
           <View style={styles.cardFooterMeta}>
             <View style={styles.footerSourceGroup}>
               <View
@@ -685,7 +765,13 @@ export default function CalculatorScreen() {
               <Text
                 style={[styles.footerMetaText, { color: colors.textSecondary }]}
               >
-                1 {selectedCurrency} = {formatCurrencyDisplay(activeRate)} Bs
+                Previa:{' '}
+                {formatCurrencyDisplay(
+                  selectedCurrency === 'USD'
+                    ? ratesData.previousUsd
+                    : ratesData.previousEur
+                )}{' '}
+                Bs
               </Text>
             </View>
 
@@ -839,7 +925,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.18,
     shadowRadius: 16,
     elevation: 10,
-    minWidth: 185,
+    minWidth: 205,
   },
   popoverItem: {
     flexDirection: 'row',
